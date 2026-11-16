@@ -9,6 +9,8 @@ from app.schemas.recipe import RecipeIn, RecipeOut, RecipePage
 from app.services.recipe_access import visible_to
 from app.services.scaling import scale_quantity
 
+from app.services.allergens import compute_allergens
+
 router = APIRouter(prefix="/recipes", tags=["recipes"])
 
 
@@ -108,7 +110,7 @@ async def create_recipe(
         total_time_min=data.total_time_min,
         steps=data.steps,
         diet_tags=data.diet_tags,
-        allergens=[],  # Phase 4: compute from ingredients
+        allergens=compute_allergens([i.name for i in data.ingredients]),
         source="catalog",
         owner_id=None,
     )
@@ -137,7 +139,7 @@ async def update_recipe(
     recipe.steps = data.steps
     recipe.diet_tags = data.diet_tags
     recipe.ingredients = _build_ingredients(data)  # old ones are deleted (delete-orphan)
-    # Phase 4: recompute allergens here
+    recipe.allergens = compute_allergens([i.name for i in data.ingredients])
     await db.commit()
     await db.refresh(recipe)
     # Phase 5: re-index this recipe
