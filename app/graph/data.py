@@ -1,3 +1,4 @@
+"""Database access for the graph. Each function opens its own short session."""
 import logging
 
 from sqlalchemy import func, or_, select
@@ -77,3 +78,12 @@ async def search_candidates(user_id: int, constraints: dict, query: str) -> list
     for item in items:
         item["distance"] = distances.get(item["id"])
     return items
+
+
+async def get_recipe(user_id: int, recipe_id: int) -> dict | None:
+    """One recipe, but only if this user is allowed to see it."""
+    async with SessionLocal() as db:
+        recipe = await db.scalar(
+            select(Recipe).where(Recipe.id == recipe_id, visible_to(user_id))
+        )
+        return _recipe_to_dict(recipe) if recipe else None

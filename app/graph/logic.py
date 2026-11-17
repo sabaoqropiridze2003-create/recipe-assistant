@@ -1,19 +1,36 @@
+"""Pure functions used by the chef graph. No LLM, no database, no LangGraph here,
+so everything in this file can be unit-tested instantly."""
+import re
 from types import SimpleNamespace
 
 from app.services.allergens import compute_allergens
-from app.services.normalize import clean_list
+from app.services.normalize import clean_list, normalize_name
 from app.services.pantry_match import names_match, pantry_match
+from app.services.safety import diet_claim_problems, safety_violations
+from app.services.scaling import scale_quantity
 
 INTENTS = {"find_recipe", "meal_plan", "shopping_list", "cooking_help", "off_topic"}
+COOKING_TASKS = {"scale", "substitute", "technique"}
 VALID_MEALS = {"breakfast", "lunch", "dinner", "snack", "dessert"}
 MAX_RELAX = 2  
+MAX_GENERATIONS = 2  
 MAX_CANDIDATES = 8  
 MAX_CARDS = 3  
 
 _DIET_RANK = {None: 0, "none": 0, "vegetarian": 1, "vegan": 2}
+STAPLE_NAMES = {"salt", "pepper", "black pepper", "water", "oil", "olive oil", "vegetable oil"}
+
+WARNING_EN = (
+    "Warning: this recipe was created by AI and has not been verified in the catalog. "
+    "If you have an allergy, please double-check the ingredients yourself."
+)
+WARNING_KA = (
+    "გაფრთხილება: ეს რეცეპტი AI-მ შექმნა და კატალოგში გადამოწმებული არ არის. "
+    "ალერგიის შემთხვევაში ინგრედიენტები თავად გადაამოწმეთ."
+)
 
 
-
+# ----------------------------------------------------------------- cleaning the LLM output
 def _int_in_range(value, low: int, high: int) -> int | None:
     try:
         number = int(value)
@@ -30,6 +47,8 @@ def sanitize_constraints(raw: dict) -> dict:
     meal = str(raw.get("meal_type") or "").strip().lower()
     cuisine = str(raw.get("cuisine") or "").strip().lower() or None
     diet = str(raw.get("diet") or "").strip().lower()
+    task = str(raw.get("cooking_task") or "").strip().lower()
+    ingredient = normalize_name(str(raw.get("ingredient") or ""))[:100] or None
 
     return {
         "ingredients": ingredients,
@@ -39,6 +58,9 @@ def sanitize_constraints(raw: dict) -> dict:
         "cuisine": cuisine,
         "meal_type": meal if meal in VALID_MEALS else None,
         "diet": diet if diet in ("vegetarian", "vegan") else None,
+        "cooking_task": task if task in COOKING_TASKS else None,
+        "ingredient": ingredient,
+        "reference_index": _int_in_range(raw.get("reference_index"), 1, 10),
         "min_overlap": 1 if ingredients else 0,
     }
 
@@ -51,7 +73,7 @@ def stricter_diet(profile_diet: str | None, request_diet: str | None) -> str | N
     return max((profile_diet, request_diet), key=lambda d: _DIET_RANK[d])
 
 
-
+# ----------------------------------------------------------------- relaxing the search
 def relax(constraints: dict, attempt: int) -> dict:
     """Loosen the SEARCH conditions. attempt = relaxations already made (0 = the first one).
     Allergies and diet are not even passed in here, and exclusions are kept."""
@@ -69,6 +91,7 @@ def relax(constraints: dict, attempt: int) -> dict:
     return relaxed
 
 
+# ----------------------------------------------------------------- routing (edges)
 def route_after_understand(state: dict) -> str:
     intent = state.get("intent")
     if intent == "error":
@@ -79,7 +102,12 @@ def route_after_understand(state: dict) -> str:
 
 
 def route_after_context(state: dict) -> str:
-    return "search" if state.get("intent") in ("find_recipe", "meal_plan") else "not_ready"
+    intent = state.get("intent")
+    if intent in ("find_recipe", "meal_plan"):
+        return "search"
+    if intent == "cooking_help":
+        return "helper"
+    return "not_ready"
 
 
 def route_after_safety(state: dict) -> str:
@@ -87,10 +115,12 @@ def route_after_safety(state: dict) -> str:
         return "compose"
     if state.get("relax_attempts", 0) < MAX_RELAX:
         return "relax"
-    return "generate"
+    if state.get("generation_attempts", 0) < MAX_GENERATIONS:
+        return "generate"
+    return "compose"
 
 
-
+# ----------------------------------------------------------------- ranking and cards
 def rank_candidates(raw: list[dict], *, available: list[str], mentioned: list[str], min_overlap: int):
     """Add the pantry match score to each recipe, drop recipes that use none of the
     ingredients the user mentioned (if required), and sort best first."""
@@ -132,13 +162,177 @@ def build_cards(recipes: list[dict], limit: int = MAX_CARDS) -> list[dict]:
                 "match": recipe.get("match_score", 0.0),
                 "allergens": sorted(set(recipe.get("allergens", [])) | set(compute_allergens(names))),
                 "source": recipe.get("source", "catalog"),
+                "ai_generated": recipe.get("source") == "ai_generated",
             }
         )
     return cards
 
 
-def fallback_answer(cards: list[dict]) -> str:
+# ----------------------------------------------------------------- AI-generated recipes
+def derive_diet_tags(texts: list[str]) -> list[str]:
+    """Tags for an AI recipe are decided by CODE from its text, never by the LLM's word.
+    A tag is granted only if no ingredient contradicts it."""
+    return [
+        tag
+        for tag in ("vegetarian", "vegan", "gluten_free")
+        if not diet_claim_problems([tag], texts)
+    ]
+
+
+def sanitize_draft(raw: dict, default_servings: int = 2) -> dict | None:
+    """Clean a recipe invented by the LLM. Returns None if it is not usable."""
+    try:
+        title = str(raw.get("title") or "").strip()[:100]
+        description = str(raw.get("description") or "").strip()[:300]
+        servings = _int_in_range(raw.get("servings"), 1, 20) or max(1, min(default_servings, 20))
+        minutes = _int_in_range(raw.get("total_time_min"), 1, 480)
+        steps = [str(s).strip() for s in (raw.get("steps") or []) if str(s).strip()][:30]
+
+        ingredients = []
+        for item in raw.get("ingredients") or []:
+            name = normalize_name(str(item.get("name") or ""))[:100]
+            unit = normalize_name(str(item.get("unit") or ""))[:20]
+            try:
+                quantity = float(item.get("quantity"))
+            except (TypeError, ValueError):
+                continue
+            if name and unit and quantity > 0:
+                ingredients.append(
+                    {
+                        "name": name,
+                        "quantity": round(quantity, 2),
+                        "unit": unit,
+                        "is_staple": name in STAPLE_NAMES,
+                    }
+                )
+    except AttributeError:
+        return None
+
+    if not title or minutes is None or len(ingredients) < 2 or len(steps) < 2:
+        return None
+    return {
+        "title": title,
+        "description": description,
+        "servings": servings,
+        "total_time_min": minutes,
+        "ingredients": ingredients,
+        "steps": steps,
+    }
+
+
+def build_generated_candidate(draft: dict, available: list[str]) -> dict:
+    """Turn a cleaned draft into the same shape as a catalog recipe. Allergens and tags are
+    computed by code from the ingredient names AND the title and steps, because an LLM can
+    hide an allergen in the instructions ('stir in a splash of cream')."""
+    names = [i["name"] for i in draft["ingredients"]]
+    scan_text = [draft["title"], *draft["steps"]]
+    match = pantry_match([SimpleNamespace(**i) for i in draft["ingredients"]], available)
+    return {
+        "id": None,  
+        "title": draft["title"],
+        "description": draft["description"],
+        "cuisine": None,
+        "meal_type": None,
+        "servings": draft["servings"],
+        "total_time_min": draft["total_time_min"],
+        "diet_tags": derive_diet_tags(names + scan_text),
+        "allergens": compute_allergens(names + scan_text),
+        "source": "ai_generated",
+        "ingredients": draft["ingredients"],
+        "steps": draft["steps"],
+        "scan_text": scan_text,
+        "match_score": match.score,
+        "missing": match.missing,
+        "distance": None,
+    }
+
+
+def ai_warning(user_text: str) -> str:
+    """The mandatory AI warning, in the user's language. Added by code, not by the LLM."""
+    return WARNING_KA if re.search(r"[\u10A0-\u10FF]", user_text or "") else WARNING_EN
+
+
+def recipe_details(recipe: dict) -> dict:
+    """What the LLM gets to write the full text of an AI-generated recipe."""
+    return {
+        "title": recipe["title"],
+        "description": recipe.get("description", ""),
+        "servings": recipe["servings"],
+        "total_time_min": recipe["total_time_min"],
+        "ingredients": [
+            {"name": i["name"], "quantity": i["quantity"], "unit": i["unit"]}
+            for i in recipe["ingredients"]
+        ],
+        "steps": recipe.get("steps", []),
+    }
+
+
+# ----------------------------------------------------------------- cooking helper
+def resolve_reference(last_shown: list[dict], index: int | None) -> dict | None:
+    """Which previously shown recipe does the user mean? None if it is unclear."""
+    if not last_shown:
+        return None
+    if index is not None and 1 <= index <= len(last_shown):
+        return last_shown[index - 1]
+    if len(last_shown) == 1:
+        return last_shown[0]
+    return None
+
+
+def scale_recipe(recipe: dict, target_servings: int) -> dict:
+    """Pure arithmetic. The LLM never multiplies anything."""
+    base = recipe["servings"]
+    return {
+        "title": recipe["title"],
+        "base_servings": base,
+        "servings": target_servings,
+        "ingredients": [
+            {
+                "name": i["name"],
+                "quantity": scale_quantity(i["quantity"], base, target_servings),
+                "unit": i["unit"],
+            }
+            for i in recipe["ingredients"]
+        ],
+    }
+
+
+def safe_substitutes(
+    options: list[str], *, original: str | None, allergies: list[str], diet: str | None,
+    disliked: list[str],
+) -> tuple[list[str], int]:
+    """The LLM suggests substitutes, but each one goes through the same safety check as a recipe."""
+    original_name = normalize_name(original or "")
+    safe: list[str] = []
+    hidden = 0
+    for name in clean_list([str(o) for o in options])[:8]:
+        if name == original_name:
+            continue
+        violations = safety_violations(
+            allergies=allergies,
+            diet=diet,
+            disliked=disliked,
+            ingredient_names=[name],
+            allergens=[],
+            diet_tags=derive_diet_tags([name]),
+        )
+        if violations:
+            hidden += 1
+        else:
+            safe.append(name)
+    return safe[:5], hidden
+
+
+# ----------------------------------------------------------------- fallback texts
+def fallback_answer(cards: list[dict], generated: dict | None = None) -> str:
     """Used when the LLM cannot write the answer: the user still gets the facts."""
+    if generated:
+        lines = [f"{generated['title']} ({generated['total_time_min']} min)", "", "Ingredients:"]
+        for ing in generated["ingredients"]:
+            lines.append(f"- {ing['quantity']} {ing['unit']} {ing['name']}")
+        lines += ["", "Steps:"]
+        lines += [f"{n}. {step}" for n, step in enumerate(generated.get("steps", []), 1)]
+        return "\n".join(lines)
     if not cards:
         return (
             "I couldn't find a suitable recipe for this request. "
@@ -151,7 +345,28 @@ def fallback_answer(cards: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def fallback_helper_answer(result: dict) -> str:
+    kind = result.get("kind")
+    if kind == "scale":
+        lines = [f"{result['title']} for {result['servings']} servings:"]
+        lines += [f"- {i['quantity']} {i['unit']} {i['name']}" for i in result["ingredients"]]
+        return "\n".join(lines)
+    if kind == "substitute":
+        if result.get("options"):
+            return f"Instead of {result['ingredient']} you can use: " + ", ".join(result["options"]) + "."
+        return f"I couldn't find a safe substitute for {result['ingredient']}."
+    if kind == "clarify":
+        questions = {
+            "which_recipe": "Which of the recipes do you mean? Please tell me its name or number.",
+            "no_recipe": "Which recipe do you mean? I don't have one to work with yet.",
+            "servings": "For how many servings should I scale it?",
+            "ingredient": "Which ingredient would you like to replace?",
+        }
+        return questions.get(result.get("reason"), "Could you tell me a bit more?")
+    return "I couldn't answer that right now. Please try again in a moment."
 
+
+# ----------------------------------------------------------------- helpers for messages
 def last_user_text(messages: list) -> str:
     for message in reversed(messages):
         if getattr(message, "type", None) == "human":
