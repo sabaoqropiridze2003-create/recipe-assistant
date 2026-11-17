@@ -6,6 +6,13 @@ from app.services.allergens import (
 )
 from app.services.normalize import clean_list
 
+MEAT_KEYWORDS = [
+    "chicken", "beef", "pork", "lamb", "veal", "turkey", "duck", "bacon", "ham", "sausage",
+    "mince", "meat", "gelatin", "lard",
+    "ქათამი", "ღორის", "საქონლის", "ცხვრის",
+]
+NON_VEGAN_EXTRAS = ["honey", "gelatin"]
+
 
 def diet_ok(diet: str | None, diet_tags: list[str]) -> bool:
     if diet in (None, "none"):
@@ -14,7 +21,26 @@ def diet_ok(diet: str | None, diet_tags: list[str]) -> bool:
         return "vegan" in diet_tags
     if diet == "vegetarian":
         return "vegetarian" in diet_tags or "vegan" in diet_tags
-    return False  
+    return False
+
+def diet_claim_problems(diet_tags: list[str], ingredient_names: list[str]) -> list[str]:
+    """Check that the diet tags a recipe CLAIMS are consistent with its ingredients."""
+    problems: list[str] = []
+    allergens = set(compute_allergens(ingredient_names))
+    has_meat = "seafood" in allergens or any(
+        mentions_term(ingredient_names, w) for w in MEAT_KEYWORDS
+    )
+
+    if ("vegetarian" in diet_tags or "vegan" in diet_tags) and has_meat:
+        problems.append("tagged vegetarian/vegan but contains meat or fish")
+    if "vegan" in diet_tags:
+        if allergens & {"dairy", "eggs"}:
+            problems.append("tagged vegan but contains dairy or eggs")
+        if any(mentions_term(ingredient_names, w) for w in NON_VEGAN_EXTRAS):
+            problems.append("tagged vegan but contains honey or gelatin")
+    if "gluten_free" in diet_tags and "gluten" in allergens:
+        problems.append("tagged gluten_free but contains gluten")
+    return problems  
 
 
 def safety_violations(

@@ -11,6 +11,9 @@ from app.services.scaling import scale_quantity
 
 from app.services.allergens import compute_allergens
 
+from app.services.safety import diet_claim_problems
+from app.services.vector_store import index_recipe, remove_recipe_vector
+
 router = APIRouter(prefix="/recipes", tags=["recipes"])
 
 
@@ -30,6 +33,25 @@ async def _get_catalog_recipe(db: AsyncSession, recipe_id: int) -> Recipe:
     if recipe is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Recipe not found")
     return recipe
+
+def _check_diet_claims(data: RecipeIn) -> None:
+    problems = diet_claim_problems(data.diet_tags, [i.name for i in data.ingredients])
+    if problems:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=problems)
+
+
+async def _index_or_502(recipe: Recipe) -> None:
+    try:
+        await index_recipe(recipe)
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Recipe {recipe.id} was saved, but indexing it for search failed "
+                f"({type(exc).__name__}). Fix the cause and run "
+                "'python -m scripts.seed_recipes' to re-sync."
+            ),
+        )
 
 
 @router.get("", response_model=RecipePage)
@@ -101,6 +123,8 @@ async def create_recipe(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    _check_diet_claims(data)
+
     recipe = Recipe(
         title=data.title,
         description=data.description,
@@ -118,7 +142,7 @@ async def create_recipe(
     db.add(recipe)
     await db.commit()
     await db.refresh(recipe)
-    # Phase 5: index this recipe in the vector store
+    await _index_or_502(recipe)
     return recipe
 
 
@@ -129,6 +153,8 @@ async def update_recipe(
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    _check_diet_claims(data)
+
     recipe = await _get_catalog_recipe(db, recipe_id)
     recipe.title = data.title
     recipe.description = data.description
@@ -138,11 +164,11 @@ async def update_recipe(
     recipe.total_time_min = data.total_time_min
     recipe.steps = data.steps
     recipe.diet_tags = data.diet_tags
-    recipe.ingredients = _build_ingredients(data)  # old ones are deleted (delete-orphan)
+    recipe.ingredients = _build_ingredients(data)
     recipe.allergens = compute_allergens([i.name for i in data.ingredients])
     await db.commit()
     await db.refresh(recipe)
-    # Phase 5: re-index this recipe
+    await _index_or_502(recipe)
     return recipe
 
 
@@ -155,4 +181,13 @@ async def delete_recipe(
     recipe = await _get_catalog_recipe(db, recipe_id)
     await db.delete(recipe)
     await db.commit()
-    # Phase 5: remove this recipe's vectors
+    try:
+        await remove_recipe_vector(recipe_id)
+    except Exception as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Recipe deleted, but removing its search vector failed ({type(exc).__name__}). "
+                "Search always starts from SQL results, so a leftover vector is ignored."
+            ),
+        )

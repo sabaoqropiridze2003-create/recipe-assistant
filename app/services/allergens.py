@@ -5,20 +5,25 @@ from app.services.normalize import normalize_name
 
 ALLERGEN_KEYWORDS: dict[str, list[str]] = {
     "dairy": [
-        "milk", "cheese", "butter", "cream", "yogurt", "yoghurt", "ghee", "whey",
+        "milk", "cheese", "butter", "cream", "yogurt", "yoghurt", "ghee", "whey", "kefir",
+        "feta", "parmesan", "mozzarella", "ricotta", "mascarpone", "sulguni", "matsoni",
         "რძე", "რძის", "ყველი", "კარაქი", "მაწონი", "არაჟანი",
     ],
     "nuts": [
         "almond", "walnut", "hazelnut", "cashew", "pistachio", "pecan", "peanut",
+        "pine nut", "macadamia",
         "ნიგოზი", "თხილი", "ნუში",
     ],
     "gluten": [
         "wheat", "flour", "bread", "pasta", "noodle", "couscous", "semolina", "barley", "rye",
+        "spaghetti", "penne", "macaroni", "lasagna", "bulgur", "tortilla", "pita", "dough",
+        "cracker",
         "ფქვილი", "პური", "მაკარონი",
     ],
-    "eggs": ["egg", "mayonnaise", "კვერცხი"],
+    "eggs": ["egg", "yolk", "mayonnaise", "meringue", "კვერცხი"],
     "seafood": [
         "shrimp", "fish", "salmon", "tuna", "crab", "lobster", "prawn", "squid", "anchovy",
+        "cod", "mussel", "oyster", "clam", "scallop", "sardine", "trout",
         "თევზი", "კრევეტი",
     ],
 }
