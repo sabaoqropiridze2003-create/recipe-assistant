@@ -41,6 +41,11 @@ class Constraints(BaseModel):
 
 
 class RequestAnalysis(BaseModel):
+    language: str = Field(
+        default="English",
+        description="The language the user's LAST message is written in, as an English word "
+        "(English, Georgian, Spanish, ...).",
+    )
     intent: Literal["find_recipe", "meal_plan", "shopping_list", "cooking_help", "off_topic"]
     constraints: Constraints = Field(default_factory=Constraints)
     refers_to_previous: bool = Field(

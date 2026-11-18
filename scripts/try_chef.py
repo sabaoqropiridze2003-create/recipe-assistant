@@ -35,11 +35,16 @@ async def main(user_id: int, text: str, shown_ids: list[int]) -> None:
         await engine.dispose()
 
     print("intent:          ", state.get("intent"))
+    print("language:        ", state.get("language"))
     print("constraints:     ", state.get("constraints"))
     print("relax attempts:  ", state.get("relax_attempts"))
     print("AI attempts:     ", state.get("generation_attempts"))
     print("hidden (safety): ", state.get("blocked_summary"))
     print("helper result:   ", state.get("helper_result"))
+    if state.get("generation_attempts"):
+        draft = state.get("generated_recipe") or (state.get("candidates") or [{}])[0]
+        print("last AI draft:   ", draft.get("title"))
+        print("why rejected:    ", state.get("generation_feedback") or "(accepted)")
     print("cards:")
     for card in state.get("cards", []):
         tag = " [AI]" if card.get("ai_generated") else ""

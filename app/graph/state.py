@@ -10,6 +10,7 @@ class ChefState(TypedDict, total=False):
 
     intent: str  # find_recipe | meal_plan | shopping_list | cooking_help | off_topic | error
     refers_to_previous: bool
+    language: str  
     constraints: dict
 
     profile: dict  

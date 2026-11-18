@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
     chat_model: str = "gemini-3.8-flash"
+    generation_model: str = "gemini-3.8-flash"
       
     @property
     def vector_database_url(self) -> str:

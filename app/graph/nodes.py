@@ -11,16 +11,23 @@ from app.graph.logic import (
     build_cards,
     build_generated_candidate,
     build_query,
+    describe_problems,
     fallback_answer,
     fallback_helper_answer,
+    forbidden_words,
+    format_generated_recipe,
+    format_options,
+    format_scaled,
+    labels_for,
     last_user_text,
     rank_candidates,
-    recipe_details,
+    recipe_summary,
     relax,
     resolve_reference,
     safe_substitutes,
     sanitize_constraints,
     sanitize_draft,
+    sanitize_language,
     scale_recipe,
     stricter_diet,
     to_history,
@@ -34,6 +41,7 @@ logger = logging.getLogger(__name__)
 ERROR_TEXT = "Sorry, I couldn't process that right now. Please try again in a moment."
 REFUSAL_FALLBACK = "I can only help with food, cooking and recipes. Is there something you'd like to cook?"
 COMING_SOON_TEXT = "That feature is not available yet. For now I can help you find recipes."
+NEW_RECIPE_INTRO = "I created a new recipe for you:"
 
 
 def _turn_reset() -> dict:
@@ -80,12 +88,17 @@ class ChefNodes:
         return {
             **reset,
             "intent": intent,
+            "language": sanitize_language(analysis.get("language")),
             "refers_to_previous": bool(analysis.get("refers_to_previous")),
             "constraints": constraints,
         }
 
     async def polite_refusal(self, state: ChefState) -> dict:
-        payload = {"task": "refusal", "user_message": last_user_text(state.get("messages", []))}
+        payload = {
+            "task": "refusal",
+            "user_message": last_user_text(state.get("messages", [])),
+            "reply_language": state.get("language", "English"),
+        }
         try:
             text = await self.deps.llm.compose(payload)
         except Exception:
@@ -142,17 +155,17 @@ class ChefNodes:
                 allergens=recipe.get("allergens", []),
                 diet_tags=recipe.get("diet_tags", []),
             )
-            if violations:
-                blocked.update(violations)
-                if recipe.get("source") == "ai_generated":
-                    feedback.extend(violations)
-            else:
+            if not violations:
                 safe.append(recipe)
-        return {
-            "safe_recipes": safe,
-            "blocked_summary": dict(blocked),
-            "generation_feedback": feedback,
-        }
+            elif recipe.get("source") == "ai_generated":
+                feedback.extend(describe_problems(recipe, allergies, diet, disliked) or violations)
+            else:
+                blocked.update(violations)
+
+        update: dict = {"safe_recipes": safe, "generation_feedback": feedback}
+        if state.get("generation_attempts", 0) == 0:
+            update["blocked_summary"] = dict(blocked)
+        return update
 
     async def relax_constraints(self, state: ChefState) -> dict:
         attempts = state.get("relax_attempts", 0)
@@ -172,9 +185,11 @@ class ChefNodes:
 
         brief = {
             "user_message": last_user_text(state.get("messages", [])),
+            "language": state.get("language", "English"),
             "ingredients_to_use": constraints.get("ingredients", []),
             "pantry": list(state.get("pantry", []))[:30],
             "must_avoid": allergies,
+            "forbidden_words": forbidden_words(allergies, disliked),
             "disliked": disliked,
             "diet": diet,
             "max_time_min": constraints.get("max_time_min"),
@@ -204,7 +219,7 @@ class ChefNodes:
     async def _load_recipe(self, state: ChefState, card: dict) -> dict | None:
         if card.get("id") is not None and self.deps.get_recipe:
             return await self.deps.get_recipe(state["user_id"], card["id"])
-        last = state.get("last_generated")  # an AI recipe has no database id
+        last = state.get("last_generated") 
         if last and last.get("title") == card.get("title"):
             return last
         return None
@@ -270,13 +285,16 @@ class ChefNodes:
         cards = build_cards(safe)
         profile = state.get("profile", {})
         user_text = last_user_text(state.get("messages", []))
+        language = state.get("language", "English")
         generated = next((r for r in safe if r.get("source") == "ai_generated"), None)
 
         payload = {
             "task": "recipes",
             "user_message": user_text,
+            "reply_language": language,
             "recipes": cards,
-            "generated_recipe": recipe_details(generated) if generated else None,
+            "generated_recipe": recipe_summary(generated) if generated else None,
+            "ai_generation_failed": state.get("generation_attempts", 0) > 0 and generated is None,
             "no_results": not cards,
             "hidden_for_safety": state.get("blocked_summary", {}),
             "search_was_relaxed": state.get("relax_attempts", 0) > 0,
@@ -286,10 +304,11 @@ class ChefNodes:
             text = await self.deps.llm.compose(payload)
         except Exception:
             logger.exception("compose_answer: LLM failed, using fallback text")
-            text = fallback_answer(cards, generated)
+            text = NEW_RECIPE_INTRO if generated else fallback_answer(cards)
 
-        if generated:  
-            text = f"{text}\n\n{ai_warning(user_text)}"
+        if generated:
+            body = format_generated_recipe(generated, labels_for(user_text, language))
+            text = f"{text}\n\n{body}\n\n{ai_warning(user_text)}"
 
         update = {
             "answer": text,
@@ -304,14 +323,22 @@ class ChefNodes:
     async def _compose_helper(self, state: ChefState) -> dict:
         result = state.get("helper_result") or {"kind": "technique"}
         profile = state.get("profile", {})
+        user_text = last_user_text(state.get("messages", []))
+        language = state.get("language", "English")
         payload = {
             "task": "cooking_help",
-            "user_message": last_user_text(state.get("messages", [])),
+            "user_message": user_text,
+            "reply_language": language,
             "helper_result": result,
             "user_profile": {"allergies": profile.get("allergies", []), "diet": profile.get("diet")},
         }
         try:
             text = await self.deps.llm.compose(payload)
+            labels = labels_for(user_text, language)
+            if result.get("kind") == "scale":
+                text = f"{text}\n\n{format_scaled(result, labels)}"
+            elif result.get("kind") == "substitute" and result.get("options"):
+                text = f"{text}\n\n{format_options(result, labels)}"
         except Exception:
             logger.exception("compose_answer (helper): LLM failed, using fallback text")
             text = fallback_helper_answer(result)
@@ -319,3 +346,4 @@ class ChefNodes:
 
     async def coming_soon(self, state: ChefState) -> dict:
         return {"answer": COMING_SOON_TEXT, "messages": [AIMessage(content=COMING_SOON_TEXT)]}
+

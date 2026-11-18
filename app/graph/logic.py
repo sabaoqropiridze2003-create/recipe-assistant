@@ -3,7 +3,12 @@ so everything in this file can be unit-tested instantly."""
 import re
 from types import SimpleNamespace
 
-from app.services.allergens import compute_allergens
+from app.services.allergens import (
+    ALLERGEN_KEYWORDS,
+    canonical_allergy,
+    compute_allergens,
+    mentions_term,
+)
 from app.services.normalize import clean_list, normalize_name
 from app.services.pantry_match import names_match, pantry_match
 from app.services.safety import diet_claim_problems, safety_violations
@@ -252,19 +257,100 @@ def ai_warning(user_text: str) -> str:
     return WARNING_KA if re.search(r"[\u10A0-\u10FF]", user_text or "") else WARNING_EN
 
 
-def recipe_details(recipe: dict) -> dict:
-    """What the LLM gets to write the full text of an AI-generated recipe."""
+def recipe_summary(recipe: dict) -> dict:
+    """The only facts about an AI recipe the LLM gets: enough for a short introduction.
+    The ingredient list and the steps are written by code (format_generated_recipe)."""
     return {
         "title": recipe["title"],
         "description": recipe.get("description", ""),
         "servings": recipe["servings"],
         "total_time_min": recipe["total_time_min"],
-        "ingredients": [
-            {"name": i["name"], "quantity": i["quantity"], "unit": i["unit"]}
-            for i in recipe["ingredients"]
-        ],
-        "steps": recipe.get("steps", []),
     }
+
+
+def describe_problems(recipe: dict, allergies: list[str], diet: str | None, disliked: list[str]) -> list[str]:
+    """Tell the LLM WHICH ingredient or step broke a rule, so a retry can fix exactly that."""
+    problems: list[str] = []
+    texts = [i["name"] for i in recipe["ingredients"]] + list(recipe.get("scan_text", []))
+    for text in texts:
+        shown = text if len(text) <= 60 else text[:57] + "..."
+        found = set(compute_allergens([text]))
+        for allergy in clean_list(allergies):
+            category = canonical_allergy(allergy)
+            if category in ALLERGEN_KEYWORDS:
+                if category in found:
+                    problems.append(f'"{shown}" contains {category}')
+            elif mentions_term([text], category):
+                problems.append(f'"{shown}" contains {category}')
+        for term in clean_list(disliked):
+            if mentions_term([text], term):
+                problems.append(f'"{shown}" contains {term}, which the user dislikes')
+    if diet in ("vegan", "vegetarian"):
+        for problem in diet_claim_problems([diet], texts):
+            problems.append(f"diet {diet}: {problem}")
+    return problems[:10]
+
+
+def forbidden_words(allergies: list[str], disliked: list[str]) -> list[str]:
+    """Every English word the LLM must not use, spelled out, so nothing is left to guess."""
+    words: list[str] = []
+    for allergy in clean_list(allergies):
+        category = canonical_allergy(allergy)
+        words += ALLERGEN_KEYWORDS.get(category, [category])
+    words += clean_list(disliked)
+    return sorted({w for w in words if w.isascii()})
+
+
+def sanitize_language(value) -> str:
+    text = str(value or "").strip()
+    return text if re.fullmatch(r"[A-Za-z][A-Za-z \-]{0,29}", text) else "English"
+
+
+# ----------------------------------------------------------------- text written by code
+LABELS = {
+    "en": {"ingredients": "Ingredients", "steps": "Steps", "options": "Options",
+           "minutes": "min", "servings": "servings"},
+    "ka": {"ingredients": "ინგრედიენტები", "steps": "მომზადება", "options": "ვარიანტები",
+           "minutes": "წთ", "servings": "პორცია"},
+}
+
+
+def labels_for(user_text: str, language: str = "English") -> dict:
+    georgian = (language or "").lower() == "georgian" or re.search(r"[\u10A0-\u10FF]", user_text or "")
+    return LABELS["ka"] if georgian else LABELS["en"]
+
+
+def _fmt_qty(quantity) -> str:
+    number = float(quantity)
+    return str(int(number)) if number.is_integer() else f"{number:g}"
+
+
+def format_ingredient_lines(ingredients: list[dict]) -> str:
+    return "\n".join(f"- {_fmt_qty(i['quantity'])} {i['unit']} {i['name']}" for i in ingredients)
+
+
+def format_generated_recipe(recipe: dict, labels: dict | None = None) -> str:
+    """The recipe itself, written by code from the cleaned data, so nothing can be dropped or invented."""
+    labels = labels or LABELS["en"]
+    lines = [f"{recipe['title']} - {recipe['total_time_min']} {labels['minutes']}, "
+             f"{recipe['servings']} {labels['servings']}"]
+    if recipe.get("description"):
+        lines.append(recipe["description"])
+    lines += ["", f"{labels['ingredients']}:", format_ingredient_lines(recipe["ingredients"]), "",
+              f"{labels['steps']}:"]
+    lines += [f"{n}. {step}" for n, step in enumerate(recipe.get("steps", []), 1)]
+    return "\n".join(lines)
+
+
+def format_scaled(result: dict, labels: dict | None = None) -> str:
+    labels = labels or LABELS["en"]
+    return (f"{result['title']} - {result['servings']} {labels['servings']}:\n"
+            + format_ingredient_lines(result["ingredients"]))
+
+
+def format_options(result: dict, labels: dict | None = None) -> str:
+    labels = labels or LABELS["en"]
+    return f"{labels['options']}: " + ", ".join(result["options"])
 
 
 # ----------------------------------------------------------------- cooking helper
@@ -327,12 +413,7 @@ def safe_substitutes(
 def fallback_answer(cards: list[dict], generated: dict | None = None) -> str:
     """Used when the LLM cannot write the answer: the user still gets the facts."""
     if generated:
-        lines = [f"{generated['title']} ({generated['total_time_min']} min)", "", "Ingredients:"]
-        for ing in generated["ingredients"]:
-            lines.append(f"- {ing['quantity']} {ing['unit']} {ing['name']}")
-        lines += ["", "Steps:"]
-        lines += [f"{n}. {step}" for n, step in enumerate(generated.get("steps", []), 1)]
-        return "\n".join(lines)
+        return format_generated_recipe(generated)
     if not cards:
         return (
             "I couldn't find a suitable recipe for this request. "
@@ -348,9 +429,7 @@ def fallback_answer(cards: list[dict], generated: dict | None = None) -> str:
 def fallback_helper_answer(result: dict) -> str:
     kind = result.get("kind")
     if kind == "scale":
-        lines = [f"{result['title']} for {result['servings']} servings:"]
-        lines += [f"- {i['quantity']} {i['unit']} {i['name']}" for i in result["ingredients"]]
-        return "\n".join(lines)
+        return format_scaled(result)
     if kind == "substitute":
         if result.get("options"):
             return f"Instead of {result['ingredient']} you can use: " + ", ".join(result["options"]) + "."
