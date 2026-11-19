@@ -32,6 +32,22 @@ target_metadata = Base.metadata
 # my_important_option = config.get_main_option("my_important_option")
 # ... etc.
 
+# Tables created and managed by other libraries. They are not in our models,
+# so Alembic must never create, change or drop them.
+EXTERNAL_TABLES = {
+    "langchain_pg_collection",
+    "langchain_pg_embedding",  # LangChain vector store
+    "checkpoints",
+    "checkpoint_blobs",
+    "checkpoint_writes",
+    "checkpoint_migrations",  # LangGraph chat memory
+}
+
+
+def include_object(obj, name, type_, reflected, compare_to):
+    if type_ == "table" and name in EXTERNAL_TABLES:
+        return False
+    return True
 
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
@@ -51,6 +67,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
+        include_object=include_object
     )
 
     with context.begin_transaction():
@@ -58,7 +75,7 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(connection=connection, target_metadata=target_metadata, include_object=include_object)
 
     with context.begin_transaction():
         context.run_migrations()

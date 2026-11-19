@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60
     chat_model: str = "gemini-3.8-flash"
     generation_model: str = "gemini-3.8-flash"
+
+    environment: str = "development"
+    chat_messages_per_hour: int = 30
       
     @property
     def vector_database_url(self) -> str:
