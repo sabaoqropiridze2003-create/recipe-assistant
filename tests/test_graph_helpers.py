@@ -37,7 +37,7 @@ RAW = {
 # ---- tests from the spec's list ----
 
 def test_generated_recipe_allergens_found_by_code_even_when_the_llm_says_nothing():
-    raw = {**RAW, "allergens": [],  
+    raw = {**RAW, "allergens": [],  # whatever the LLM claims is ignored
            "ingredients": [{"name": "butter", "quantity": 20, "unit": "g"},
                            {"name": "wheat flour", "quantity": 100, "unit": "g"}]}
     candidate = build_generated_candidate(sanitize_draft(raw), available=[])
@@ -50,7 +50,7 @@ def test_scale_recipe_triples_for_six_servings():
                               {"name": "oil", "quantity": 1, "unit": "tbsp"}]}
     scaled = scale_recipe(recipe, 6)
     assert [i["quantity"] for i in scaled["ingredients"]] == [300, 3]
-    assert recipe["ingredients"][0]["quantity"] == 100  
+    assert recipe["ingredients"][0]["quantity"] == 100  # the original is untouched
 
 
 # ---- extra tests ----
@@ -73,7 +73,7 @@ def test_sanitize_draft_clamps_and_skips_bad_lines():
              "ingredients": RAW["ingredients"] + [{"name": "ghost", "quantity": -5, "unit": "g"},
                                                   {"name": "", "quantity": 1, "unit": "g"}]}
     draft = sanitize_draft(messy, default_servings=4)
-    assert draft["servings"] == 4  
+    assert draft["servings"] == 4  # 500 is out of range, so the default is used
     assert len(draft["description"]) == 300
     assert [i["name"] for i in draft["ingredients"]] == ["banana", "chia seeds"]
 
@@ -98,9 +98,9 @@ def test_ai_warning_language():
 def test_resolve_reference():
     shown = [{"id": 1}, {"id": 2}, {"id": 3}]
     assert resolve_reference(shown, 2) == {"id": 2}
-    assert resolve_reference(shown, None) is None  
+    assert resolve_reference(shown, None) is None  # ambiguous: ask the user
     assert resolve_reference(shown, 9) is None
-    assert resolve_reference([{"id": 1}], None) == {"id": 1}  
+    assert resolve_reference([{"id": 1}], None) == {"id": 1}  # only one candidate
     assert resolve_reference([], 1) is None
 
 
@@ -108,7 +108,7 @@ def test_substitutes_are_filtered_by_allergy_and_diet():
     kwargs = dict(original="egg", disliked=[])
     safe, hidden = safe_substitutes(["flaxseed", "yogurt", "egg", "applesauce"],
                                     allergies=["dairy"], diet="none", **kwargs)
-    assert safe == ["flaxseed", "applesauce"] and hidden == 1  
+    assert safe == ["flaxseed", "applesauce"] and hidden == 1  # the original itself is skipped
     safe, hidden = safe_substitutes(["honey", "maple syrup"], allergies=[], diet="vegan", **kwargs)
     assert safe == ["maple syrup"] and hidden == 1
 
@@ -120,7 +120,8 @@ def test_routing_for_generation_and_helper():
     assert route_after_safety({**empty, "generation_attempts": MAX_GENERATIONS}) == "compose"
     assert route_after_context({"intent": "cooking_help"}) == "helper"
     assert route_after_context({"intent": "find_recipe"}) == "search"
-    assert route_after_context({"intent": "shopping_list"}) == "not_ready"
+    assert route_after_context({"intent": "shopping_list"}) == "shopping"
+    assert route_after_context({"intent": "save_recipe"}) == "save_recipe"
 
 
 def test_fallback_texts_still_give_the_facts():
@@ -145,14 +146,14 @@ def test_problems_name_the_offending_ingredient_and_step():
     assert '"almond milk" contains dairy' in problems
     assert '"almond milk" contains nuts' in problems
     assert '"avocado" contains avocado, which the user dislikes' in problems
-    assert any("cream" in p and "dairy" in p for p in problems)  
+    assert any("cream" in p and "dairy" in p for p in problems)  # hidden in a step
     assert any(p.startswith("diet vegan") for p in problems)
 
 
 def test_forbidden_words_are_spelled_out_in_english_only():
     words = forbidden_words(["dairy", "Kiwi"], ["avocado"])
     assert {"milk", "butter", "cheese", "kiwi", "avocado"} <= set(words)
-    assert "რძე" not in words  
+    assert "რძე" not in words  # Georgian keywords are for matching, not for the prompt
 
 
 def test_sanitize_language():
@@ -166,7 +167,7 @@ def test_generated_recipe_text_is_written_by_code():
     recipe = build_generated_candidate(sanitize_draft(RAW), [])
     text = format_generated_recipe(recipe)
     assert "Banana Pudding - 15 min, 2 servings" in text
-    assert "- 2 pcs banana" in text and "- 30 g chia seeds" in text  
+    assert "- 2 pcs banana" in text and "- 30 g chia seeds" in text  # 2.0 is shown as 2
     assert "1. Blend." in text and "2. Chill." in text
     georgian = format_generated_recipe(recipe, labels_for("მინდა დესერტი"))
     assert "ინგრედიენტები:" in georgian and "წთ" in georgian

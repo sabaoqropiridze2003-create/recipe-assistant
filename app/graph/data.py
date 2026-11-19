@@ -3,7 +3,15 @@ import logging
 
 from sqlalchemy import func, or_, select
 
-from app.db.models import DietaryProfile, PantryItem, Recipe
+from app.db.models import (
+    DietaryProfile,
+    PantryItem,
+    Recipe,
+    RecipeIngredient,
+    SavedRecipe,
+    ShoppingList,
+    ShoppingListItem,
+)
 from app.db.session import SessionLocal
 from app.services.recipe_access import visible_to
 from app.services.vector_store import search_similar
@@ -87,3 +95,83 @@ async def get_recipe(user_id: int, recipe_id: int) -> dict | None:
             select(Recipe).where(Recipe.id == recipe_id, visible_to(user_id))
         )
         return _recipe_to_dict(recipe) if recipe else None
+
+
+async def get_pantry(user_id: int) -> list[dict]:
+    """The pantry WITH quantities (load_context only needs the names)."""
+    async with SessionLocal() as db:
+        rows = await db.scalars(select(PantryItem).where(PantryItem.user_id == user_id))
+        return [{"name": r.name, "quantity": r.quantity, "unit": r.unit} for r in rows.all()]
+
+
+async def save_shopping_list(user_id: int, title: str, items: list[dict]) -> int:
+    """Only called AFTER the user confirmed. user_id comes from the server, never from the client."""
+    async with SessionLocal() as db:
+        shopping_list = ShoppingList(user_id=user_id, title=title[:255])
+        shopping_list.items = [
+            ShoppingListItem(
+                name=i["name"],
+                quantity=i.get("quantity"),
+                unit=i.get("unit"),
+                recipe_id=i.get("recipe_id"),
+            )
+            for i in items
+        ]
+        db.add(shopping_list)
+        await db.commit()
+        await db.refresh(shopping_list)
+        return shopping_list.id
+
+
+async def save_recipe_to_cookbook(user_id: int, recipe: dict) -> int:
+    """Only called AFTER the user confirmed. A catalog recipe is just added to the cookbook.
+    An AI recipe is first stored as a private recipe (source 'ai_generated') and then added."""
+    async with SessionLocal() as db:
+        recipe_id = recipe.get("id")
+        if recipe_id is None:
+            existing = await db.scalar(
+                select(Recipe.id).where(
+                    Recipe.owner_id == user_id,
+                    Recipe.source == "ai_generated",
+                    Recipe.title == recipe["title"],
+                )
+            )
+            if existing:
+                recipe_id = existing
+            else:
+                row = Recipe(
+                    title=recipe["title"],
+                    description=recipe.get("description", ""),
+                    cuisine=recipe.get("cuisine"),
+                    meal_type=recipe.get("meal_type") or "dinner",
+                    servings=recipe["servings"],
+                    total_time_min=recipe["total_time_min"],
+                    steps=recipe.get("steps", []),
+                    diet_tags=recipe.get("diet_tags", []),
+                    allergens=recipe.get("allergens", []),
+                    source="ai_generated",
+                    owner_id=user_id,
+                )
+                row.ingredients = [
+                    RecipeIngredient(
+                        name=i["name"],
+                        quantity=i["quantity"],
+                        unit=i["unit"],
+                        is_staple=i.get("is_staple", False),
+                    )
+                    for i in recipe["ingredients"]
+                ]
+                db.add(row)
+                await db.flush()  
+                recipe_id = row.id
+        else:
+            visible = await db.scalar(
+                select(Recipe.id).where(Recipe.id == recipe_id, visible_to(user_id))
+            )
+            if visible is None:
+                raise ValueError("recipe not found")
+
+        if await db.get(SavedRecipe, (user_id, recipe_id)) is None:
+            db.add(SavedRecipe(user_id=user_id, recipe_id=recipe_id))
+        await db.commit()
+        return recipe_id

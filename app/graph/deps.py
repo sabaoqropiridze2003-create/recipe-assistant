@@ -22,11 +22,21 @@ class ChefDeps:
     load_context: Callable[[int], Awaitable[tuple[dict, list[str]]]]
     search: Callable[[int, dict, str], Awaitable[list[dict]]]
     get_recipe: Callable[[int, int], Awaitable[dict | None]] | None = None
+    get_pantry: Callable[[int], Awaitable[list[dict]]] | None = None
+    save_shopping_list: Callable[[int, str, list[dict]], Awaitable[int]] | None = None
+    save_recipe: Callable[[int, dict], Awaitable[int]] | None = None
 
 
 def make_default_deps() -> ChefDeps:
     """The real thing: Gemini + the database. Imported lazily so tests never need them."""
-    from app.graph.data import get_recipe, load_context, search_candidates
+    from app.graph.data import (
+        get_pantry,
+        get_recipe,
+        load_context,
+        save_recipe_to_cookbook,
+        save_shopping_list,
+        search_candidates,
+    )
     from app.graph.llm import GeminiChefLLM
 
     return ChefDeps(
@@ -34,4 +44,7 @@ def make_default_deps() -> ChefDeps:
         load_context=load_context,
         search=search_candidates,
         get_recipe=get_recipe,
+        get_pantry=get_pantry,
+        save_shopping_list=save_shopping_list,
+        save_recipe=save_recipe_to_cookbook,
     )

@@ -25,8 +25,9 @@ class ChefState(TypedDict, total=False):
     generation_feedback: list[str]  
     helper_result: dict | None  
 
-    pending_action: dict | None
+    pending_action: dict | None  
     confirmed: bool | None
+    action_result: dict | None  
 
     cards: list[dict]  
     last_shown: list[dict]  

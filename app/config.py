@@ -16,4 +16,8 @@ class Settings(BaseSettings):
     def vector_database_url(self) -> str:
         return self.database_url.replace("+asyncpg", "+psycopg")
 
+    @property
+    def checkpoint_database_url(self) -> str:
+        return self.database_url.replace("postgresql+asyncpg://", "postgresql://")
+
 settings = Settings()

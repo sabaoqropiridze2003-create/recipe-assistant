@@ -14,7 +14,7 @@ from app.services.pantry_match import names_match, pantry_match
 from app.services.safety import diet_claim_problems, safety_violations
 from app.services.scaling import scale_quantity
 
-INTENTS = {"find_recipe", "meal_plan", "shopping_list", "cooking_help", "off_topic"}
+INTENTS = {"find_recipe", "meal_plan", "shopping_list", "cooking_help", "save_recipe", "off_topic"}
 COOKING_TASKS = {"scale", "substitute", "technique"}
 VALID_MEALS = {"breakfast", "lunch", "dinner", "snack", "dessert"}
 MAX_RELAX = 2  
@@ -66,6 +66,7 @@ def sanitize_constraints(raw: dict) -> dict:
         "cooking_task": task if task in COOKING_TASKS else None,
         "ingredient": ingredient,
         "reference_index": _int_in_range(raw.get("reference_index"), 1, 10),
+        "all_shown": raw.get("all_shown") is True,
         "min_overlap": 1 if ingredients else 0,
     }
 
@@ -108,11 +109,24 @@ def route_after_understand(state: dict) -> str:
 
 def route_after_context(state: dict) -> str:
     intent = state.get("intent")
-    if intent in ("find_recipe", "meal_plan"):
-        return "search"
     if intent == "cooking_help":
         return "helper"
-    return "not_ready"
+    if intent == "shopping_list":
+        return "shopping"
+    if intent == "save_recipe":
+        return "save_recipe"
+    return "search"  
+
+
+def route_after_prepare(state: dict) -> str:
+    """After building a shopping list / preparing a recipe save: ask for confirmation,
+    or go straight to the answer if there is nothing to confirm."""
+    return "confirm" if state.get("pending_action") else "compose"
+
+
+def route_after_confirm(state: dict) -> str:
+    """Anything except an explicit True means: do not save."""
+    return "save" if state.get("confirmed") is True else "compose"
 
 
 def route_after_safety(state: dict) -> str:
@@ -369,6 +383,7 @@ def scale_recipe(recipe: dict, target_servings: int) -> dict:
     """Pure arithmetic. The LLM never multiplies anything."""
     base = recipe["servings"]
     return {
+        "id": recipe.get("id"),
         "title": recipe["title"],
         "base_servings": base,
         "servings": target_servings,
@@ -377,6 +392,7 @@ def scale_recipe(recipe: dict, target_servings: int) -> dict:
                 "name": i["name"],
                 "quantity": scale_quantity(i["quantity"], base, target_servings),
                 "unit": i["unit"],
+                "is_staple": i.get("is_staple", False),
             }
             for i in recipe["ingredients"]
         ],
@@ -409,6 +425,135 @@ def safe_substitutes(
     return safe[:5], hidden
 
 
+# ----------------------------------------------------------------- shopping list and saving
+def pick_recipes(last_shown: list[dict], index: int | None, all_shown: bool) -> list[dict]:
+    """Which of the previously shown recipes does the user mean? Empty list = unclear."""
+    if not last_shown:
+        return []
+    if all_shown:
+        return list(last_shown)
+    card = resolve_reference(last_shown, index)
+    return [card] if card else []
+
+
+def build_shopping_items(recipes: list[dict], pantry: list[dict]) -> list[dict]:
+    """What to buy = what the recipes need - what the pantry has. Pure arithmetic, no LLM.
+    - staples (salt, oil, water) are never listed
+    - the same ingredient from several recipes is added up
+    - a pantry item with an unknown amount counts as 'enough'
+    - amounts are only subtracted when the units match (we never guess a conversion)"""
+    needed: dict[tuple[str, str], dict] = {}
+    for recipe in recipes:
+        for ing in recipe["ingredients"]:
+            if ing.get("is_staple"):
+                continue
+            entry = needed.setdefault(
+                (ing["name"], ing["unit"]),
+                {"name": ing["name"], "unit": ing["unit"], "quantity": 0.0, "recipe_ids": set()},
+            )
+            entry["quantity"] += ing["quantity"]
+            entry["recipe_ids"].add(recipe.get("id"))
+
+    items = []
+    for entry in needed.values():
+        owned = [p for p in pantry if names_match(entry["name"], p["name"])]
+        if any(p.get("quantity") is None for p in owned):
+            continue
+        have = sum(p["quantity"] for p in owned if p.get("unit") == entry["unit"])
+        missing = round(entry["quantity"] - have, 2)
+        if missing <= 0:
+            continue
+        ids = entry["recipe_ids"]
+        items.append(
+            {
+                "name": entry["name"],
+                "quantity": missing,
+                "unit": entry["unit"],
+                "recipe_id": next(iter(ids)) if len(ids) == 1 else None,
+            }
+        )
+    return items
+
+
+def shopping_title(recipes: list[dict]) -> str:
+    if len(recipes) == 1:
+        return f"Shopping list: {recipes[0]['title']}"[:255]
+    return f"Shopping list ({len(recipes)} recipes)"
+
+
+def parse_confirmation(answer) -> tuple[bool, list | None]:
+    """What the user answered at the confirmation step. Only an explicit True approves."""
+    if isinstance(answer, bool):
+        return answer, None
+    if isinstance(answer, dict):
+        items = answer.get("items")
+        return answer.get("approved") is True, items if isinstance(items, list) else None
+    return False, None
+
+
+def sanitize_items(raw, original: list[dict]) -> list[dict]:
+    """The user may edit the list before saving. Whatever arrives is cleaned like any other input."""
+    by_name = {i["name"]: i for i in original}
+    items: list[dict] = []
+    seen: set[str] = set()
+    for item in (raw[:100] if isinstance(raw, list) else []):
+        if not isinstance(item, dict):
+            continue
+        name = normalize_name(str(item.get("name") or ""))[:100]
+        if not name or name in seen:
+            continue
+        quantity = item.get("quantity")
+        if quantity is not None:
+            try:
+                quantity = float(quantity)
+            except (TypeError, ValueError):
+                continue
+            if quantity <= 0:
+                continue
+            quantity = round(quantity, 2)
+        unit = normalize_name(str(item.get("unit") or ""))[:20] or None
+        items.append(
+            {
+                "name": name,
+                "quantity": quantity,
+                "unit": unit,
+                "recipe_id": by_name.get(name, {}).get("recipe_id"),  
+            }
+        )
+        seen.add(name)
+    return items
+
+
+def describe_pending(pending: dict) -> dict:
+    """What the user is shown at the confirmation step (it also goes out as an SSE event)."""
+    if pending["type"] == "save_shopping_list":
+        return {
+            "type": "confirmation_required",
+            "action": "save_shopping_list",
+            "title": pending["title"],
+            "items": [
+                {"name": i["name"], "quantity": i.get("quantity"), "unit": i.get("unit")}
+                for i in pending["items"]
+            ],
+        }
+    recipe = pending["recipe"]
+    return {
+        "type": "confirmation_required",
+        "action": "save_recipe",
+        "title": recipe["title"],
+        "ai_generated": recipe.get("source") == "ai_generated",
+    }
+
+
+def format_items(items: list[dict]) -> str:
+    lines = []
+    for item in items:
+        quantity = item.get("quantity")
+        amount = f"{_fmt_qty(quantity)} {item.get('unit') or ''}".strip() if quantity else ""
+        lines.append(f"- {amount} {item['name']}" if amount else f"- {item['name']}")
+    return "\n".join(lines)
+
+
 # ----------------------------------------------------------------- fallback texts
 def fallback_answer(cards: list[dict], generated: dict | None = None) -> str:
     """Used when the LLM cannot write the answer: the user still gets the facts."""
@@ -424,6 +569,23 @@ def fallback_answer(cards: list[dict], generated: dict | None = None) -> str:
         missing = ", ".join(card["missing"]) if card["missing"] else "nothing"
         lines.append(f"- {card['title']} ({card['time']} min). Missing: {missing}.")
     return "\n".join(lines)
+
+
+def fallback_action_answer(result: dict) -> str:
+    status = result.get("status")
+    if status == "saved" and result.get("type") == "save_shopping_list":
+        return f"Saved: {result['title']} ({len(result['items'])} items)."
+    if status == "saved":
+        return f"Saved to your cookbook: {result['title']}."
+    if status == "declined":
+        return "Okay, nothing was saved."
+    if status == "nothing_to_buy":
+        return "You already have everything you need for this recipe."
+    if status == "clarify":
+        if result.get("reason") == "which_recipe":
+            return "Which recipe do you mean? Please tell me its name or number."
+        return "Which recipe do you mean? I don't have one to work with yet."
+    return "Sorry, I couldn't save that. Nothing was changed, please try again."
 
 
 def fallback_helper_answer(result: dict) -> str:

@@ -38,6 +38,10 @@ class Constraints(BaseModel):
         description="1-based position of the previously shown recipe the user means "
         "('the second one' -> 2), or null.",
     )
+    all_shown: bool = Field(
+        default=False,
+        description="True if the user means ALL the recipes that were shown ('for all of them').",
+    )
 
 
 class RequestAnalysis(BaseModel):
@@ -46,7 +50,9 @@ class RequestAnalysis(BaseModel):
         description="The language the user's LAST message is written in, as an English word "
         "(English, Georgian, Spanish, ...).",
     )
-    intent: Literal["find_recipe", "meal_plan", "shopping_list", "cooking_help", "off_topic"]
+    intent: Literal[
+        "find_recipe", "meal_plan", "shopping_list", "cooking_help", "save_recipe", "off_topic"
+    ]
     constraints: Constraints = Field(default_factory=Constraints)
     refers_to_previous: bool = Field(
         default=False,

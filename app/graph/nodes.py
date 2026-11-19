@@ -2,6 +2,7 @@ import logging
 from collections import Counter
 
 from langchain_core.messages import AIMessage
+from langgraph.types import interrupt
 
 from app.graph.deps import ChefDeps
 from app.graph.logic import (
@@ -9,26 +10,34 @@ from app.graph.logic import (
     MAX_CANDIDATES,
     ai_warning,
     build_cards,
+    build_shopping_items,
     build_generated_candidate,
     build_query,
+    describe_pending,
     describe_problems,
+    fallback_action_answer,
     fallback_answer,
     fallback_helper_answer,
     forbidden_words,
     format_generated_recipe,
+    format_items,
     format_options,
     format_scaled,
     labels_for,
     last_user_text,
+    parse_confirmation,
+    pick_recipes,
     rank_candidates,
     recipe_summary,
     relax,
     resolve_reference,
     safe_substitutes,
     sanitize_constraints,
+    sanitize_items,
     sanitize_draft,
     sanitize_language,
     scale_recipe,
+    shopping_title,
     stricter_diet,
     to_history,
 )
@@ -40,7 +49,6 @@ logger = logging.getLogger(__name__)
 
 ERROR_TEXT = "Sorry, I couldn't process that right now. Please try again in a moment."
 REFUSAL_FALLBACK = "I can only help with food, cooking and recipes. Is there something you'd like to cook?"
-COMING_SOON_TEXT = "That feature is not available yet. For now I can help you find recipes."
 NEW_RECIPE_INTRO = "I created a new recipe for you:"
 
 
@@ -59,6 +67,7 @@ def _turn_reset() -> dict:
         "helper_result": None,
         "pending_action": None,
         "confirmed": None,
+        "action_result": None,
         "cards": [],
         "answer": "",
     }
@@ -107,7 +116,6 @@ class ChefNodes:
         return {"answer": text, "messages": [AIMessage(content=text)]}
 
     async def load_context(self, state: ChefState) -> dict:
-        # user_id comes from the server (JWT), never from the LLM
         profile, pantry = await self.deps.load_context(state["user_id"])
         return {"profile": profile, "pantry": pantry}
 
@@ -211,6 +219,7 @@ class ChefNodes:
         if draft:
             available = clean_list(list(state.get("pantry", [])) + constraints.get("ingredients", []))
             candidate = build_generated_candidate(draft, available)
+            candidate["meal_type"] = constraints.get("meal_type")
             update["candidates"] = [candidate]
             update["generated_recipe"] = candidate
         return update
@@ -219,7 +228,7 @@ class ChefNodes:
     async def _load_recipe(self, state: ChefState, card: dict) -> dict | None:
         if card.get("id") is not None and self.deps.get_recipe:
             return await self.deps.get_recipe(state["user_id"], card["id"])
-        last = state.get("last_generated") 
+        last = state.get("last_generated")  
         if last and last.get("title") == card.get("title"):
             return last
         return None
@@ -280,6 +289,8 @@ class ChefNodes:
     async def compose_answer(self, state: ChefState) -> dict:
         if state.get("intent") == "cooking_help":
             return await self._compose_helper(state)
+        if state.get("intent") in ("shopping_list", "save_recipe"):
+            return await self._compose_action(state)
 
         safe = state.get("safe_recipes", [])
         cards = build_cards(safe)
@@ -344,6 +355,124 @@ class ChefNodes:
             text = fallback_helper_answer(result)
         return {"answer": text, "messages": [AIMessage(content=text)]}
 
-    async def coming_soon(self, state: ChefState) -> dict:
-        return {"answer": COMING_SOON_TEXT, "messages": [AIMessage(content=COMING_SOON_TEXT)]}
+    # ------------------------------------------------------------ actions that write to the database
+    async def build_shopping_list(self, state: ChefState) -> dict:
+        """What to buy = recipe ingredients - pantry. All arithmetic is code. Nothing is saved here."""
+        constraints = state["constraints"]
+        last_shown = state.get("last_shown", [])
+        cards = pick_recipes(last_shown, constraints.get("reference_index"), constraints.get("all_shown"))
+        if not cards:
+            return {"action_result": self._clarify(last_shown)}
 
+        recipes = []
+        for card in cards:
+            recipe = await self._load_recipe(state, card)
+            if recipe:
+                target = constraints.get("servings")
+                recipes.append(scale_recipe(recipe, target) if target else recipe)
+        if not recipes:
+            return {"action_result": self._clarify([])}
+
+        pantry = await self.deps.get_pantry(state["user_id"]) if self.deps.get_pantry else []
+        items = build_shopping_items(recipes, pantry)
+        if not items:
+            return {"action_result": {"status": "nothing_to_buy", "type": "save_shopping_list"}}
+        return {
+            "pending_action": {
+                "type": "save_shopping_list",
+                "title": shopping_title(recipes),
+                "items": items,
+            }
+        }
+
+    async def prepare_save_recipe(self, state: ChefState) -> dict:
+        """Which recipe does the user want in the cookbook? Nothing is saved here."""
+        constraints = state["constraints"]
+        last_shown = state.get("last_shown", [])
+        cards = pick_recipes(last_shown, constraints.get("reference_index"), False)
+        if not cards:
+            return {"action_result": self._clarify(last_shown)}
+        recipe = await self._load_recipe(state, cards[0])
+        if recipe is None:
+            return {"action_result": self._clarify([])}
+        return {"pending_action": {"type": "save_recipe", "recipe": recipe}}
+
+    def _clarify(self, last_shown: list[dict]) -> dict:
+        if last_shown:
+            return {
+                "status": "clarify",
+                "reason": "which_recipe",
+                "options": [c["title"] for c in last_shown],
+            }
+        return {"status": "clarify", "reason": "no_recipe"}
+
+    async def confirm_action(self, state: ChefState) -> dict:
+        """The graph STOPS here and waits. When the user answers, this node runs again from the
+        top and interrupt() returns their answer, so nothing with side effects may come before it."""
+        pending = state["pending_action"]
+        answer = interrupt(describe_pending(pending))
+
+        approved, edited = parse_confirmation(answer)
+        update: dict = {"confirmed": approved}
+        if approved and pending["type"] == "save_shopping_list" and edited is not None:
+            items = sanitize_items(edited, pending["items"])
+            if items:
+                update["pending_action"] = {**pending, "items": items}
+            else:  
+                update["confirmed"] = False
+        if update["confirmed"] is not True:
+            update["action_result"] = {"status": "declined", "type": pending["type"]}
+        return update
+
+    async def save_pending_action(self, state: ChefState) -> dict:
+        """The only place where the assistant writes to the database, and only after a 'yes'.
+        user_id comes from the server and the data comes from the state, never from the client."""
+        pending = state["pending_action"]
+        user_id = state["user_id"]
+        try:
+            if pending["type"] == "save_shopping_list":
+                list_id = await self.deps.save_shopping_list(user_id, pending["title"], pending["items"])
+                result = {
+                    "status": "saved", "type": "save_shopping_list", "title": pending["title"],
+                    "items": pending["items"], "list_id": list_id,
+                }
+                return {"action_result": result}
+
+            recipe = pending["recipe"]
+            recipe_id = await self.deps.save_recipe(user_id, recipe)
+            result = {"status": "saved", "type": "save_recipe", "title": recipe["title"], "recipe_id": recipe_id}
+            update: dict = {"action_result": result}
+            if state.get("last_generated") and state["last_generated"].get("title") == recipe["title"]:
+                update["last_generated"] = {**state["last_generated"], "id": recipe_id}
+            update["last_shown"] = [
+                {**c, "id": recipe_id} if c.get("title") == recipe["title"] and c.get("id") is None else c
+                for c in state.get("last_shown", [])
+            ]
+            return update
+        except Exception:
+            logger.exception("save_pending_action failed")
+            return {"action_result": {"status": "failed", "type": pending["type"]}}
+
+    async def _compose_action(self, state: ChefState) -> dict:
+        result = state.get("action_result") or {"status": "failed", "type": "unknown"}
+        user_text = last_user_text(state.get("messages", []))
+        language = state.get("language", "English")
+        facts = {k: v for k, v in result.items() if k != "items"}
+        if result.get("items"):
+            facts["item_count"] = len(result["items"])
+        payload = {
+            "task": "action",
+            "user_message": user_text,
+            "reply_language": language,
+            "action_result": facts,
+        }
+        try:
+            text = await self.deps.llm.compose(payload)
+            if result.get("status") == "saved" and result.get("items"):
+                text = f"{text}\n\n{format_items(result['items'])}"
+        except Exception:
+            logger.exception("compose_answer (action): LLM failed, using fallback text")
+            text = fallback_action_answer(result)
+            if result.get("status") == "saved" and result.get("items"):
+                text = f"{text}\n\n{format_items(result['items'])}"
+        return {"answer": text, "messages": [AIMessage(content=text)]}
