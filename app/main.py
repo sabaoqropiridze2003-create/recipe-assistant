@@ -6,7 +6,7 @@ from fastapi import FastAPI, Request
 from app.graph.builder import build_chef_graph
 from app.graph.checkpoint import open_checkpointer
 from app.graph.deps import make_default_deps
-from app.routers import auth, chat, cookbook, pantry, profile, recipes, shopping_lists
+from app.routers import analytics, auth, chat, cookbook, pantry, profile, recipes, shopping_lists
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -42,6 +42,7 @@ app.include_router(recipes.router)
 app.include_router(cookbook.router)
 app.include_router(shopping_lists.router)
 app.include_router(chat.router)
+app.include_router(analytics.router)
 
 
 @app.get("/health")
