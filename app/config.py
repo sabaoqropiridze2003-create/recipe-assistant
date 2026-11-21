@@ -14,6 +14,10 @@ class Settings(BaseSettings):
 
     environment: str = "development"
     chat_messages_per_hour: int = 30
+
+    langsmith_tracing: bool = False
+    langsmith_api_key: str = ""
+    langsmith_project: str = "recipe-assistant"
       
     @property
     def vector_database_url(self) -> str:

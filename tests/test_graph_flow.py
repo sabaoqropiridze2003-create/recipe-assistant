@@ -397,3 +397,30 @@ async def test_the_llm_is_told_when_generation_failed():
     graph, _ = make_graph(llm, profile={"allergies": ["dairy"]}, search_results=[[]])
     await ask(graph, "something please")
     assert llm.payloads[-1]["ai_generation_failed"] is True
+
+
+# ====================================================================== medical questions
+from app.graph.logic import MEDICAL_NOTICE_EN  # noqa: E402
+
+
+async def test_a_health_question_always_gets_the_doctor_notice():
+    recipe = make_recipe(1, "Lentil Soup", ["lentils", "carrot"])
+    llm = FakeLLM(result=analysis(ingredients=[]), text="Try the lentil soup.")  # the LLM forgets the rule
+    graph, _ = make_graph(llm, search_results=[[recipe]])
+    state = await ask(graph, "I have diabetes, what should I eat?")
+    assert state["answer"].endswith(MEDICAL_NOTICE_EN)
+
+
+async def test_a_normal_question_gets_no_notice():
+    recipe = make_recipe(1, "Lentil Soup", ["lentils", "carrot"])
+    llm = FakeLLM(result=analysis(ingredients=[]), text="Try the lentil soup.")
+    graph, _ = make_graph(llm, search_results=[[recipe]])
+    state = await ask(graph, "a soup please")
+    assert MEDICAL_NOTICE_EN not in state["answer"]
+
+
+async def test_the_notice_also_follows_a_polite_refusal():
+    llm = FakeLLM(result={"intent": "off_topic", "constraints": {}}, text="Only food, sorry.")
+    graph, _ = make_graph(llm)
+    state = await ask(graph, "I have cancer, can you tell me which medication to take?")
+    assert state["answer"].endswith(MEDICAL_NOTICE_EN)

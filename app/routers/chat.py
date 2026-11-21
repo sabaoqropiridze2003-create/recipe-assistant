@@ -42,13 +42,18 @@ def get_graph(request: Request):
     return graph
 
 
-def thread_config(session: ChatSession) -> dict:
-    """One chat session = one LangGraph thread. Both ids are decided here on the server."""
-    return {
+def thread_config(session: ChatSession, request: Request) -> dict:
+    """One chat session = one LangGraph thread. Both ids are decided here on the server.
+    tags/metadata make the trace easy to find in LangSmith (no email, token or password in them)."""
+    config: dict = {
         "configurable": {"thread_id": f"chat-{session.id}"},
-        "tags": ["recipe-assistant"],
+        "tags": ["recipe-assistant", settings.environment],
         "metadata": {"session_id": session.id, "environment": settings.environment},
     }
+    tracer = getattr(request.app.state, "tracer", None)
+    if tracer is not None:
+        config["callbacks"] = [tracer]
+    return config
 
 
 async def _owned_session(db: AsyncSession, session_id: int, user_id: int) -> ChatSession:
@@ -118,13 +123,14 @@ async def list_sessions(user: User = Depends(get_current_user), db: AsyncSession
 @router.get("/sessions/{session_id}", response_model=SessionDetail)
 async def get_session(
     session_id: int,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     graph=Depends(get_graph),
 ):
     """Also tells the UI whether the assistant is waiting for a confirmation (e.g. after a page reload)."""
     session = await _owned_session(db, session_id, user.id)
-    pending = pending_interrupts(await graph.aget_state(thread_config(session)))
+    pending = pending_interrupts(await graph.aget_state(thread_config(session, request)))
     detail = SessionDetail.model_validate(session)
     detail.pending_confirmation = pending[0].value if pending else None
     return detail
@@ -155,11 +161,11 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
 ):
     session = await _owned_session(db, session_id, user.id)
-    config = thread_config(session)
+    config = thread_config(session, request)
     await db.delete(session)  
     await db.commit()
     checkpointer = getattr(request.app.state, "checkpointer", None)
-    if checkpointer is not None:  # also forget the saved graph state of this chat
+    if checkpointer is not None: 
         try:
             await checkpointer.adelete_thread(config["configurable"]["thread_id"])
         except Exception:
@@ -171,12 +177,13 @@ async def delete_session(
 async def send_message(
     session_id: int,
     body: SendMessageIn,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     graph=Depends(get_graph),
 ):
     session = await _owned_session(db, session_id, user.id)
-    config = thread_config(session)
+    config = thread_config(session, request)
 
     pending = pending_interrupts(await graph.aget_state(config))
     if pending:
@@ -210,12 +217,13 @@ async def send_message(
 async def confirm(
     session_id: int,
     body: ConfirmIn,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     graph=Depends(get_graph),
 ):
     session = await _owned_session(db, session_id, user.id)
-    config = thread_config(session)
+    config = thread_config(session, request)
 
     if not pending_interrupts(await graph.aget_state(config)):
         raise HTTPException(status.HTTP_409_CONFLICT, "Nothing is waiting for a confirmation.")

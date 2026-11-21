@@ -18,7 +18,7 @@ INTENTS = {"find_recipe", "meal_plan", "shopping_list", "cooking_help", "save_re
 COOKING_TASKS = {"scale", "substitute", "technique"}
 VALID_MEALS = {"breakfast", "lunch", "dinner", "snack", "dessert"}
 MAX_RELAX = 2  
-MAX_GENERATIONS = 2  
+MAX_GENERATIONS = 2 
 MAX_CANDIDATES = 8  
 MAX_CARDS = 3  
 
@@ -269,6 +269,39 @@ def build_generated_candidate(draft: dict, available: list[str]) -> dict:
 def ai_warning(user_text: str) -> str:
     """The mandatory AI warning, in the user's language. Added by code, not by the LLM."""
     return WARNING_KA if re.search(r"[\u10A0-\u10FF]", user_text or "") else WARNING_EN
+
+
+# ----------------------------------------------------------------- medical questions
+
+_MEDICAL_PATTERN = re.compile(
+    r"\bdiabet|\bcholesterol|\bblood pressure|\bhypertensi|\bkidney(?! bean)|\bheart (?:disease|condition|problem)"
+    r"|\bcancer|\bpregnan|\bbreastfeed|\bmedication|\bdisease|\billness|\bthyroid|\bgout\b|\bcrohn|\banaemi|\banemi"
+    r"|დიაბეტ|ქოლესტერ|წნევ|თირკმ|ორსულ|დაავადებ|ავადმყოფ|მედიკამენტ",
+    re.IGNORECASE,
+)
+MEDICAL_NOTICE_EN = (
+    "Note: I am a cooking assistant, not a doctor. For a health condition, please ask your doctor "
+    "or a dietitian what you can eat."
+)
+MEDICAL_NOTICE_KA = (
+    "შენიშვნა: მე კულინარიული ასისტენტი ვარ და არა ექიმი. ჯანმრთელობის პრობლემის შემთხვევაში, "
+    "რა შეგიძლიათ მიირთვათ, ექიმს ან დიეტოლოგს გაესაუბრეთ."
+)
+
+
+def needs_medical_notice(user_text: str) -> bool:
+    return bool(_MEDICAL_PATTERN.search(user_text or ""))
+
+
+def medical_notice(user_text: str, language: str = "English") -> str:
+    georgian = (language or "").lower() == "georgian" or re.search(r"[\u10A0-\u10FF]", user_text or "")
+    return MEDICAL_NOTICE_KA if georgian else MEDICAL_NOTICE_EN
+
+
+def with_medical_notice(text: str, user_text: str, language: str = "English") -> str:
+    if needs_medical_notice(user_text):
+        return f"{text}\n\n{medical_notice(user_text, language)}"
+    return text
 
 
 def recipe_summary(recipe: dict) -> dict:

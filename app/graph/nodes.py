@@ -40,6 +40,7 @@ from app.graph.logic import (
     shopping_title,
     stricter_diet,
     to_history,
+    with_medical_notice,
 )
 from app.graph.state import ChefState
 from app.services.normalize import clean_list
@@ -113,6 +114,7 @@ class ChefNodes:
         except Exception:
             logger.exception("polite_refusal: LLM failed, using fixed text")
             text = REFUSAL_FALLBACK
+        text = with_medical_notice(text, payload["user_message"], payload["reply_language"])
         return {"answer": text, "messages": [AIMessage(content=text)]}
 
     async def load_context(self, state: ChefState) -> dict:
@@ -317,6 +319,7 @@ class ChefNodes:
             logger.exception("compose_answer: LLM failed, using fallback text")
             text = NEW_RECIPE_INTRO if generated else fallback_answer(cards)
 
+        text = with_medical_notice(text, user_text, language)
         if generated:
             body = format_generated_recipe(generated, labels_for(user_text, language))
             text = f"{text}\n\n{body}\n\n{ai_warning(user_text)}"
@@ -353,6 +356,7 @@ class ChefNodes:
         except Exception:
             logger.exception("compose_answer (helper): LLM failed, using fallback text")
             text = fallback_helper_answer(result)
+        text = with_medical_notice(text, user_text, language)
         return {"answer": text, "messages": [AIMessage(content=text)]}
 
     # ------------------------------------------------------------ actions that write to the database

@@ -3,9 +3,11 @@ from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI, Request
 
+from app.config import settings
 from app.graph.builder import build_chef_graph
 from app.graph.checkpoint import open_checkpointer
 from app.graph.deps import make_default_deps
+from app.observability import build_tracer
 from app.routers import analytics, auth, chat, cookbook, pantry, profile, recipes, shopping_lists
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -18,6 +20,8 @@ async def lifespan(app: FastAPI):
     and the chat endpoints answer 503, with the reason in the log."""
     app.state.graph = None
     app.state.checkpointer = None
+    app.state.tracer = build_tracer(settings)
+    logger.info("LangSmith tracing is %s", "ON" if app.state.tracer else "off")
     async with AsyncExitStack() as stack:
         try:
             checkpointer = await stack.enter_async_context(open_checkpointer())
