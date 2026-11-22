@@ -1,0 +1,166 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.14"           
+  DEPLOY_HOST: 167.99.196.147
+  DEPLOY_PATH: /opt/recipe-assistant
+
+jobs:
+  # ------------------------------------------------------------------ CI
+  test:
+    name: Run pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: test-${{ github.ref }}
+      cancel-in-progress: true     
+
+    services:
+      postgres:                    
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: recipe
+          POSTGRES_PASSWORD: recipe_pass
+          POSTGRES_DB: recipe_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U recipe -d recipe_db"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://recipe:recipe_pass@localhost:5432/recipe_db
+      JWT_SECRET: ci-only-secret
+      ENVIRONMENT: ci
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install the dependencies
+        run: pip install -r requirements.txt
+
+      - name: Create the database tables
+        run: alembic upgrade head
+
+      - name: Run the tests
+        run: pytest -ra
+
+      - name: Check the Docker Compose file
+        run: |
+          cp .env.example .env
+          docker compose --profile prod config --quiet
+          rm -f .env
+
+      - name: Check the nginx configuration
+        run: |
+          docker run --rm \
+            -v "$PWD/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro" \
+            nginx:1.27-alpine nginx -t
+
+  # ------------------------------------------------------------------ CD
+  deploy:
+    name: Deploy to the droplet
+    needs: test                    
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false    
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          for name in DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS DEPLOY_USER; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The GitHub secret $name is missing (see DEPLOY.md, step 4)"
+              exit 1
+            fi
+          done
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host droplet
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ServerAliveInterval 30
+          EOF
+
+      - name: Copy the project to the server
+        run: |
+          # .env is NOT copied: the real one lives only on the server
+          rsync -az --delete \
+            --exclude '.git/' --exclude '.github/' --exclude '.env' --exclude '.venv/' \
+            --exclude '__pycache__/' --exclude '.pytest_cache/' --exclude '.vscode/' \
+            --exclude 'tests/' --exclude '*.zip' \
+            ./ "droplet:${DEPLOY_PATH}/"
+
+      - name: Rebuild and restart the services
+        run: |
+          ssh droplet "cd '${DEPLOY_PATH}' && bash -s" <<'REMOTE'
+          set -euo pipefail
+          if [ ! -f .env ]; then
+            echo "ERROR: ${PWD}/.env does not exist on the server (see DEPLOY.md, step 6)"
+            exit 1
+          fi
+          # build the new images, replace the containers, and wait until they are healthy
+          docker compose --profile prod up -d --build --remove-orphans --wait --wait-timeout 300
+          docker compose --profile prod ps
+          docker image prune -f
+          REMOTE
+
+      - name: Check the application on the server
+        run: |
+          ssh droplet "curl -fsS --retry 10 --retry-delay 3 --retry-connrefused http://127.0.0.1:8000/health && echo"
+          curl -fsS --max-time 20 -o /dev/null "http://${DEPLOY_HOST}/nginx-health"
+          curl -fsS --max-time 20 -o /dev/null "http://${DEPLOY_HOST}/"
+          echo "The app answers on port 80."
+
+      - name: Check that the other ports are closed from the outside
+        run: |
+          failed=0
+          for port in 8000 8501; do
+            if curl -s --max-time 5 -o /dev/null "http://${DEPLOY_HOST}:${port}/"; then
+              echo "::error::Port ${port} is reachable from the internet"
+              failed=1
+            fi
+          done
+          for port in 5432 5433; do
+            if timeout 5 bash -c "exec 3<>/dev/tcp/${DEPLOY_HOST}/${port}" 2>/dev/null; then
+              echo "::error::Port ${port} (the database) is reachable from the internet"
+              failed=1
+            fi
+          done
+          exit $failed
+
+      - name: Show the logs if something went wrong
+        if: failure()
+        run: ssh droplet "cd '${DEPLOY_PATH}' && docker compose --profile prod logs --tail=80" || true
