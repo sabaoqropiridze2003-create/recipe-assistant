@@ -45,7 +45,7 @@ jobs:
       ENVIRONMENT: ci
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v6
         with:
@@ -85,7 +85,7 @@ jobs:
       cancel-in-progress: false    
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up SSH
         env:
